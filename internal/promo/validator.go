@@ -1,13 +1,8 @@
 package promo
 
 import (
-	"bufio"
-	"compress/gzip"
 	"context"
-	"fmt"
-	"os"
 	"strings"
-	"sync"
 	"unicode"
 )
 
@@ -15,116 +10,72 @@ const (
 	minCodeLength = 8
 	maxCodeLength = 10
 	minFileHits   = 2
-	// Production coupon dumps can have long noisy lines. Keep a generous
-	// scan buffer so we do not fail on the first oversized token.
-	scannerMaxToken = 1 << 20
 )
 
-// Checker is the only coupon API the order flow needs.
-// A later Redis / DB implementation can replace FileIndex without
-// touching handlers.
+// Checker is the business-level coupon API consumed by the discount engine.
+// Storage implementations remain hidden behind Membership.
 type Checker interface {
 	Validate(ctx context.Context, code string) bool
 }
 
-// FileIndex loads gzip coupon dumps once, then answers Validate in O(1).
-type FileIndex struct {
-	mu     sync.RWMutex
-	counts map[string]int
+// Membership reports possible membership in one coupon dataset.
+//
+// A true result is deliberately not called exact: probabilistic
+// implementations such as Binary Fuse may return false positives. A false
+// result, however, means the value is definitely absent.
+type Membership interface {
+	PossiblyContains(ctx context.Context, code string) bool
 }
 
-// NewValidator - constructs an empty in-memory coupon file index.
-func NewValidator() *FileIndex {
-	return &FileIndex{
-		counts: make(map[string]int),
-	}
+// Validator owns coupon format and cross-dataset policy. It intentionally
+// knows nothing about maps, Binary Fuse filters, Redis, or files.
+type Validator struct {
+	datasets   []Membership
+	minMatches int
 }
 
-// LoadFiles - streams gzip coupon dumps in parallel and builds code-to-file-count index.
-func (v *FileIndex) LoadFiles(ctx context.Context, paths []string) error {
-	type fileResult struct {
-		codes map[string]struct{}
-		err   error
-	}
-	results := make([]fileResult, len(paths))
-	var wg sync.WaitGroup
-	for i, path := range paths {
-		wg.Add(1)
-		go func(i int, path string) {
-			defer wg.Done()
-			codes, err := readFile(ctx, path)
-			results[i] = fileResult{codes: codes, err: err}
-		}(i, path)
-	}
-	wg.Wait()
-	counts := make(map[string]int)
-	for _, result := range results {
-		if result.err != nil {
-			return result.err
-		}
-		for code := range result.codes {
-			counts[code]++
-		}
-	}
-	v.mu.Lock()
-	v.counts = counts
-	v.mu.Unlock()
-	return nil
+// NewValidator constructs the current 2-of-3 coupon policy.
+func NewValidator(datasets ...Membership) *Validator {
+	return &Validator{datasets: append([]Membership(nil), datasets...), minMatches: minFileHits}
 }
 
-// Validate - returns true when the code is 8-10 chars and appears in at least two files.
-func (v *FileIndex) Validate(ctx context.Context, code string) bool {
+// Validate returns true when a well-formed code possibly appears in at least
+// two independent datasets. Optional exact confirmation belongs in the
+// Membership implementation, below this business policy.
+func (v *Validator) Validate(ctx context.Context, code string) bool {
 	if err := ctx.Err(); err != nil {
 		return false
 	}
 	code = strings.TrimSpace(code)
-	if !validLength(code) {
+	if !validCode(code) {
 		return false
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.counts[code] >= minFileHits
-}
-
-// readFile - decompresses one gzip coupon file and returns unique codes found in it.
-func readFile(ctx context.Context, path string) (map[string]struct{}, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open coupon file %s: %w", path, err)
-	}
-	defer file.Close()
-	gzipReader, err := gzip.NewReader(file)
-	if err != nil {
-		return nil, fmt.Errorf("create gzip reader for %s: %w", path, err)
-	}
-	defer gzipReader.Close()
-	codes := make(map[string]struct{})
-	scanner := bufio.NewScanner(gzipReader)
-	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxToken)
-	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	matches := 0
+	for _, dataset := range v.datasets {
+		if dataset.PossiblyContains(ctx, code) {
+			matches++
+			if matches >= v.minMatches {
+				return true
+			}
 		}
-		collectCodes(scanner.Text(), codes)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read coupon file %s: %w", path, err)
-	}
-	return codes, nil
+	return false
 }
 
-// collectCodes - extracts unique 8-10 character alphanumeric tokens from a line.
-func collectCodes(line string, codes map[string]struct{}) {
+// collectCodes extracts valid coupon tokens from a line without retaining the
+// line or building an in-memory set. Duplicate removal is the builder's job.
+func collectCodes(line string, yield func(string) error) error {
 	start := -1
-	flush := func(end int) {
+	flush := func(end int) error {
 		if start < 0 {
-			return
+			return nil
 		}
 		token := line[start:end]
-		if validLength(token) {
-			codes[token] = struct{}{}
-		}
 		start = -1
+		if validLength(token) {
+			return yield(token)
+		}
+		return nil
 	}
 	for i, r := range line {
 		if isCodeRune(r) {
@@ -133,9 +84,11 @@ func collectCodes(line string, codes map[string]struct{}) {
 			}
 			continue
 		}
-		flush(i)
+		if err := flush(i); err != nil {
+			return err
+		}
 	}
-	flush(len(line))
+	return flush(len(line))
 }
 
 // isCodeRune - returns true when the rune is a letter or digit.
@@ -147,4 +100,17 @@ func isCodeRune(r rune) bool {
 func validLength(code string) bool {
 	n := len(code)
 	return n >= minCodeLength && n <= maxCodeLength
+}
+
+// validCode enforces the same token rules used by the offline builder.
+func validCode(code string) bool {
+	if !validLength(code) {
+		return false
+	}
+	for _, r := range code {
+		if !isCodeRune(r) {
+			return false
+		}
+	}
+	return true
 }

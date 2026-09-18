@@ -20,7 +20,7 @@ COPY data /app/data
 
 USER app
 
-ENV COUPON_DATA_DIR=/app/data
+ENV COUPON_INDEX_DIR=/app/data/indexes/v1
 
 EXPOSE 8080
 

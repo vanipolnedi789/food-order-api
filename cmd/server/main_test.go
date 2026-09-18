@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"food-order-api/internal/promo"
 )
 
 // TestProductEndpoints - checks list, get, invalid id, and missing product status codes.
@@ -75,14 +77,20 @@ func TestCreateOrder(t *testing.T) {
 	})
 }
 
-// testHandler - builds an HTTP handler with sample gzip coupon files for tests.
+// testHandler builds and loads the same persisted index used in production.
 func testHandler(t *testing.T) http.Handler {
 	t.Helper()
 	directory := t.TempDir()
-	writeCouponFile(t, directory, "couponbase1.gz", "HAPPYHRS", "SUPER100")
-	writeCouponFile(t, directory, "couponbase2.gz", "HAPPYHRS", "FIFTYOFF")
-	writeCouponFile(t, directory, "couponbase3.gz", "FIFTYOFF")
-	httpHandler, err := newHandler(context.Background(), directory)
+	inputs := []string{
+		writeCouponFile(t, directory, "couponbase1.gz", "HAPPYHRS", "SUPER100"),
+		writeCouponFile(t, directory, "couponbase2.gz", "HAPPYHRS", "FIFTYOFF"),
+		writeCouponFile(t, directory, "couponbase3.gz", "FIFTYOFF"),
+	}
+	outputRoot := t.TempDir()
+	if _, err := promo.BuildVersion(context.Background(), inputs, outputRoot, "test-v1", promo.BuildOptions{ChunkKeys: 2}); err != nil {
+		t.Fatalf("BuildVersion() error = %v", err)
+	}
+	httpHandler, err := newHandler(filepath.Join(outputRoot, "test-v1"))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -90,7 +98,7 @@ func testHandler(t *testing.T) http.Handler {
 }
 
 // writeCouponFile - writes a gzip coupon dump containing the given codes.
-func writeCouponFile(t *testing.T, directory, name string, codes ...string) {
+func writeCouponFile(t *testing.T, directory, name string, codes ...string) string {
 	t.Helper()
 	file, err := os.Create(filepath.Join(directory, name))
 	if err != nil {
@@ -108,4 +116,5 @@ func writeCouponFile(t *testing.T, directory, name string, codes ...string) {
 	if err := file.Close(); err != nil {
 		t.Fatalf("close coupon file: %v", err)
 	}
+	return file.Name()
 }

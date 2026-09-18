@@ -27,7 +27,7 @@ const (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	httpHandler, err := newHandler(ctx, couponDataDirectory())
+	httpHandler, err := newHandler(couponIndexDirectory())
 	if err != nil {
 		log.Fatalf("initialize server: %v", err)
 	}
@@ -59,21 +59,25 @@ func main() {
 	}
 }
 
-// newHandler - wires repositories, coupon index, routes, and middleware.
-func newHandler(ctx context.Context, dataDirectory string) (http.Handler, error) {
+// newHandler wires repositories, one persisted coupon index version, routes,
+// and middleware.
+func newHandler(indexDirectory string) (http.Handler, error) {
 	productRepo := repository.NewInMemoryProductRepository(seedProducts())
 	orderRepo := repository.NewInMemoryOrderRepository()
-	couponIndex := promo.NewValidator()
-	couponFiles := []string{
-		filepath.Join(dataDirectory, "couponbase1.gz"),
-		filepath.Join(dataDirectory, "couponbase2.gz"),
-		filepath.Join(dataDirectory, "couponbase3.gz"),
-	}
-	if err := couponIndex.LoadFiles(ctx, couponFiles); err != nil {
+	couponChecker, loadInfo, err := promo.LoadVersion(indexDirectory)
+	if err != nil {
 		return nil, err
 	}
+	log.Printf(
+		"coupon index loaded version=%s datasets=%d keys=%d filter_bytes=%d duration=%s",
+		loadInfo.Version,
+		loadInfo.DatasetCount,
+		loadInfo.Keys,
+		loadInfo.FilterBytes,
+		loadInfo.Duration,
+	)
 	promoEngine := promo.NewFileEngine(
-		couponIndex,
+		couponChecker,
 		promo.PercentOff(0.10),
 	)
 	productHandler := handler.NewProductHandler(service.NewProductService(productRepo))
@@ -91,12 +95,12 @@ func newHandler(ctx context.Context, dataDirectory string) (http.Handler, error)
 	), nil
 }
 
-// couponDataDirectory - returns the coupon file directory from env or ./data.
-func couponDataDirectory() string {
-	if directory := os.Getenv("COUPON_DATA_DIR"); directory != "" {
+// couponIndexDirectory returns the explicit, immutable index version to load.
+func couponIndexDirectory() string {
+	if directory := os.Getenv("COUPON_INDEX_DIR"); directory != "" {
 		return directory
 	}
-	return "data"
+	return filepath.Join("data", "indexes", "v1")
 }
 
 // seedProducts - returns the in-memory product catalog used at startup.
